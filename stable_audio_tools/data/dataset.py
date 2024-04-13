@@ -10,6 +10,8 @@ import time
 import torch
 import torchaudio
 import webdataset as wds
+import boto3
+import pickle
 
 from aeiou.core import is_silence
 from os import path
@@ -144,8 +146,6 @@ class SampleDataset(torch.utils.data.Dataset):
         self.sr = sample_rate
 
         self.custom_metadata_fn = custom_metadata_fn
-        
-        torchaudio.set_audio_backend('soundfile')
 
     def load_file(self, filename):
         ext = filename.split(".")[-1]
@@ -515,6 +515,159 @@ class S3WebDataLoader():
         
         return sample
 
+class S3SampleDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        s3_path,  # Expected format: "bucket_name/subfolder"
+        sample_size=65536,
+        sample_rate=48000,
+        random_crop=True,
+        force_channels="stereo",
+        custom_metadata_fn: Optional[Callable[[dict, torch.Tensor], dict]] = None
+    ):
+        super().__init__()
+        # Split the S3 path into bucket name and subfolder
+        parts = s3_path.split('/', 1)
+        self.bucket_name = parts[0]
+        self.subfolder = parts[1] if len(parts) > 1 else ""
+
+        self.sample_size = sample_size
+        self.sample_rate = sample_rate
+        self.random_crop = random_crop
+        self.force_channels = force_channels
+        self.custom_metadata_fn = custom_metadata_fn
+        
+        self.cache_filename = 'keys.pkl'
+        
+        # Augmentation and encoding layers
+        self.augs = torch.nn.Sequential(PhaseFlipper(),)
+        self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop)
+        self.encoding = torch.nn.Sequential(
+            Stereo() if self.force_channels == "stereo" else torch.nn.Identity(),
+            Mono() if self.force_channels == "mono" else torch.nn.Identity(),
+        )
+
+        # Initialize boto3 client
+        endpoint_url = os.getenv("IDRIVE_ENDPOINT")
+        aws_access_key_id = os.getenv("IDRIVE_ACCESS_KEY")
+        aws_secret_access_key = os.getenv("IDRIVE_SECRET_KEY")
+
+        self.s3_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key
+        )
+
+        # Get the list of file keys from the bucket
+        # self.filenames = self.list_bucket_objects(self.bucket_name, self.subfolder)
+        # print(f'Found {len(self.filenames)} audio files')
+        self.filenames = self.load_or_fetch_filenames()
+
+    def load_or_fetch_filenames(self):
+        if os.path.exists(self.cache_filename):
+            with open(self.cache_filename, 'rb') as file:
+                filenames = pickle.load(file)
+            print(f'Loaded {len(filenames)} audio files from cache')
+        else:
+            filenames = self.list_bucket_objects(self.bucket_name, self.subfolder)
+            with open(self.cache_filename, 'wb') as file:
+                pickle.dump(filenames, file)
+            print(f'Found {len(filenames)} audio files and saved to cache')
+        return filenames
+
+    def list_bucket_objects(self, bucket_name, subfolder):
+        paginator = self.s3_client.get_paginator('list_objects_v2')
+        keys = []
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=subfolder):
+            keys.extend([obj['Key'] for obj in page.get('Contents', []) if not obj['Key'].endswith('/')])
+        return keys
+
+    def load_file(self, s3_key):
+        response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+        audio_data = response['Body'].read()
+        ext = s3_key.rsplit('.', 1)[-1].lower()
+        
+        with io.BytesIO(audio_data) as audio_stream:
+            if ext == "mp3":
+                with AudioFile(audio_stream) as f:
+                    audio = f.read(f.frames)
+                    audio = torch.from_numpy(audio)
+                    sr = f.samplerate
+            else:
+                audio, sr = torchaudio.load(audio_stream, format=ext)
+
+        return audio, sr
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        while True:
+            s3_key = self.filenames[idx]
+            try:
+                start_time = time.time()
+                audio, in_sr = self.load_file(s3_key)
+    
+                if in_sr != self.sample_rate:
+                    resample_tf = T.Resample(in_sr, self.sample_rate)
+                    audio = resample_tf(audio)
+                    
+                if torch.max(torch.abs(audio)) > 0:
+                    audio = audio / torch.max(torch.abs(audio))
+                else: # Skip the file if it's silent
+                    # print(f'silent file! skipped {s3_key}')
+                    idx = random.randrange(len(self))
+                    continue
+    
+                # Initial timestamps and padding mask in case they are not set below
+                t_start, t_end, seconds_start, seconds_total, padding_mask = 0, 0, 0, 0, None
+    
+                if self.random_crop or self.sample_size:
+                    audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
+                    if seconds_total < 25:
+                        # print(f'\nunder-25s file detected!! {s3_key}: seconds_total={seconds_total}')
+                        idx = random.randrange(len(self))
+                        continue
+    
+                # Check audio for right shape and adjust if necessary
+                if audio.shape[1] < self.sample_size:
+                    print(audio.shape)
+    
+                # Ensure stereo channel
+                if audio.shape[0] < 2:
+                    audio = torch.cat([audio, audio])
+    
+                audio = self.augs(audio) if self.augs is not None else audio
+                audio = self.encoding(audio) if self.encoding is not None else audio
+    
+                relpath = f"{self.subfolder}/{s3_key}" if self.subfolder else s3_key
+    
+                info = {
+                    "path": s3_key,
+                    "relpath": relpath,
+                    "timestamps": (t_start, t_end),
+                    "seconds_start": seconds_start,
+                    "seconds_total": seconds_total,
+                    "padding_mask": padding_mask,
+                    "load_time": time.time() - start_time
+                }
+    
+                if self.custom_metadata_fn:
+                    custom_metadata = self.custom_metadata_fn(info, audio)
+                    info.update(custom_metadata)
+    
+                    if "__reject__" in info and info["__reject__"]:
+                        idx = random.randrange(len(self))
+                        continue
+    
+                return audio, info
+    
+            except Exception as e:
+                print(f'Error loading file {s3_key}: {e}')
+                idx = random.randrange(len(self))  # Get a new index to retry
+
+
 def create_dataloader_from_config(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4):
 
     dataset_type = dataset_config.get("dataset_type", None)
@@ -597,3 +750,35 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             force_channels=force_channels,
             epoch_steps=dataset_config.get("epoch_steps", 2000),
         ).data_loader
+
+    elif dataset_type == "idrive":
+        idrive_configs = dataset_config.get("datasets", None)
+        assert idrive_configs is not None, "iDrive configuration must be specified in datasets['dataset']"
+
+        custom_metadata_fn = None
+        custom_metadata_module_path = dataset_config.get("custom_metadata_module", None)
+        if custom_metadata_module_path is not None:
+            spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
+            metadata_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(metadata_module)
+            custom_metadata_fn = metadata_module.get_custom_metadata
+
+        datasets = []
+        for idrive_config in idrive_configs:
+            s3_path = idrive_config.get("s3_path", None)
+            assert s3_path is not None, "S3 path must be set for iDrive configuration"
+
+            dataset = S3SampleDataset(
+                s3_path=s3_path,
+                sample_size=sample_size,
+                sample_rate=sample_rate,
+                random_crop=dataset_config.get("random_crop", True),
+                force_channels=force_channels,
+                custom_metadata_fn=custom_metadata_fn
+            )
+            datasets.append(dataset)
+
+        combined_dataset = torch.utils.data.ConcatDataset(datasets)
+
+        return torch.utils.data.DataLoader(combined_dataset, batch_size=batch_size, shuffle=True,
+                                           num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=True, collate_fn=collation_fn)
