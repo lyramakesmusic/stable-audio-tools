@@ -57,14 +57,50 @@ def create_training_wrapper_from_config(model_config, model):
         from .diffusion import DiffusionUncondTrainingWrapper
         return DiffusionUncondTrainingWrapper(
             model, 
-            lr=training_config["learning_rate"]
+            lr=training_config["learning_rate"],
         )
     elif model_type == 'diffusion_cond':
         from .diffusion import DiffusionCondTrainingWrapper
         return DiffusionCondTrainingWrapper(
             model, 
+            lr=training_config.get("learning_rate", None),
+            causal_dropout=training_config.get("causal_dropout", 0.0),
+            mask_padding=training_config.get("mask_padding", False),
+            mask_padding_dropout=training_config.get("mask_padding_dropout", 0.0),
+            use_ema = training_config.get("use_ema", True),
+            log_loss_info=training_config.get("log_loss_info", False),
+            optimizer_configs=training_config.get("optimizer_configs", None),
+            use_reconstruction_loss=training_config.get("use_reconstruction_loss", False),
+        )
+    elif model_type == 'diffusion_prior':
+        from .diffusion import DiffusionPriorTrainingWrapper
+        from ..models.diffusion_prior import PriorType
+
+        ema_copy = create_model_from_config(model_config)
+        
+        # Copy each weight to the ema copy
+        for name, param in model.state_dict().items():
+            if isinstance(param, Parameter):
+                # backwards compatibility for serialized parameters
+                param = param.data
+            ema_copy.state_dict()[name].copy_(param)
+
+        prior_type = training_config.get("prior_type", "mono_stereo")
+
+        if prior_type == "mono_stereo":
+            prior_type_enum = PriorType.MonoToStereo
+        elif prior_type == "source_separation":
+            prior_type_enum = PriorType.SourceSeparation
+        else:
+            raise ValueError(f"Unknown prior type: {prior_type}")
+
+        return DiffusionPriorTrainingWrapper(
+            model, 
             lr=training_config["learning_rate"],
-            causal_dropout=training_config.get("causal_dropout", 0.0)
+            ema_copy=ema_copy,
+            prior_type=prior_type_enum,
+            log_loss_info=training_config.get("log_loss_info", False),
+            use_reconstruction_loss=training_config.get("use_reconstruction_loss", False),
         )
     elif model_type == 'diffusion_cond_inpaint':
         from .diffusion import DiffusionCondInpaintTrainingWrapper
@@ -87,7 +123,8 @@ def create_training_wrapper_from_config(model_config, model):
         return DiffusionAutoencoderTrainingWrapper(
             model,
             ema_copy=ema_copy,
-            lr=training_config["learning_rate"]
+            lr=training_config["learning_rate"],
+            use_reconstruction_loss=training_config.get("use_reconstruction_loss", False)
         )
     elif model_type == 'musicgen':
         from .musicgen import MusicGenTrainingWrapper
@@ -105,6 +142,25 @@ def create_training_wrapper_from_config(model_config, model):
             ema_copy=ema_copy,
             lr=training_config["learning_rate"]
         )
+    elif model_type == 'lm':
+        from .lm import AudioLanguageModelTrainingWrapper
+
+        ema_copy = create_model_from_config(model_config)
+
+        for name, param in model.state_dict().items():
+            if isinstance(param, Parameter):
+                # backwards compatibility for serialized parameters
+                param = param.data
+            ema_copy.state_dict()[name].copy_(param)
+
+        return AudioLanguageModelTrainingWrapper(
+            model,
+            ema_copy=ema_copy,
+            lr=training_config.get("learning_rate", None),
+            use_ema=training_config.get("use_ema", False),
+            optimizer_configs=training_config.get("optimizer_configs", None),
+        )
+
     else:
         raise NotImplementedError(f'Unknown model type: {model_type}')
 
@@ -135,6 +191,15 @@ def create_demo_callback_from_config(model_config, **kwargs):
     elif model_type == "diffusion_autoencoder":
         from .diffusion import DiffusionAutoencoderDemoCallback
         return DiffusionAutoencoderDemoCallback(
+            demo_every=demo_config.get("demo_every", 2000), 
+            demo_steps=demo_config.get("demo_steps", 250),
+            sample_size=model_config["sample_size"],
+            sample_rate=model_config["sample_rate"],
+            **kwargs
+        )
+    elif model_type == "diffusion_prior":
+        from .diffusion import DiffusionPriorDemoCallback
+        return DiffusionPriorDemoCallback(
             demo_every=demo_config.get("demo_every", 2000), 
             demo_steps=demo_config.get("demo_steps", 250),
             sample_size=model_config["sample_size"],
@@ -175,6 +240,19 @@ def create_demo_callback_from_config(model_config, **kwargs):
             sample_rate=model_config["sample_rate"],
             demo_cfg_scales=demo_config["demo_cfg_scales"],
             demo_conditioning=demo_config["demo_cond"],
+            **kwargs
+        )
+    
+    elif model_type == "lm":
+        from .lm import AudioLanguageModelDemoCallback
+
+        return AudioLanguageModelDemoCallback(
+            demo_every=demo_config.get("demo_every", 2000), 
+            sample_size=model_config["sample_size"],
+            sample_rate=model_config["sample_rate"],
+            demo_cfg_scales=demo_config.get("demo_cfg_scales", [1]),
+            demo_conditioning=demo_config.get("demo_cond", None),
+            num_demos=demo_config.get("num_demos", 8),
             **kwargs
         )
     else:

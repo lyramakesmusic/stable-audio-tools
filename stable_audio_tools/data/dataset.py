@@ -1,5 +1,6 @@
 import importlib
 import numpy as np
+import io
 import os
 import posixpath
 import random
@@ -17,6 +18,8 @@ from torchaudio import transforms as T
 from typing import Optional, Callable, List
 
 from .utils import Stereo, Mono, PhaseFlipper, PadCrop_Normalized_T
+
+AUDIO_KEYS = ("flac", "wav", "mp3", "m4a", "ogg", "opus")
 
 # fast_scandir implementation by Scott Hawley originally in https://github.com/zqevans/audio-diffusion/blob/main/dataset/dataset.py
 
@@ -91,7 +94,7 @@ def keyword_scandir(
 def get_audio_filenames(
     paths: list,  # directories in which to search
     keywords=None,
-    exts=['.wav', '.mp3', '.flac', '.ogg', '.aif']
+    exts=['.wav', '.mp3', '.flac', '.ogg', '.aif', '.opus']
 ):
     "recursively get a list of audio filenames"
     filenames = []
@@ -170,7 +173,7 @@ class SampleDataset(torch.utils.data.Dataset):
             start_time = time.time()
             audio = self.load_file(audio_filename)
 
-            audio, t_start, t_end, seconds_start, seconds_total = self.pad_crop(audio)
+            audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
 
             # Run augmentations on this sample (including random crop)
             if self.augs is not None:
@@ -192,6 +195,7 @@ class SampleDataset(torch.utils.data.Dataset):
             info["timestamps"] = (t_start, t_end)
             info["seconds_start"] = seconds_start
             info["seconds_total"] = seconds_total
+            info["padding_mask"] = padding_mask
 
             end_time = time.time()
 
@@ -200,6 +204,9 @@ class SampleDataset(torch.utils.data.Dataset):
             if self.custom_metadata_fn is not None:
                 custom_metadata = self.custom_metadata_fn(info, audio)
                 info.update(custom_metadata)
+
+                if "__reject__" in info and info["__reject__"]:
+                    return self[random.randrange(len(self))]
 
             return (audio, info)
         except Exception as e:
@@ -241,7 +248,7 @@ wds.tariterators.group_by_keys = group_by_keys
 
 # S3 code and WDS preprocessing code based on implementation by Scott Hawley originally in https://github.com/zqevans/audio-diffusion/blob/main/dataset/dataset.py
 
-def get_s3_contents(dataset_path, s3_url_prefix=None, filter='', recursive=True, debug=False, profile='default'):
+def get_s3_contents(dataset_path, s3_url_prefix=None, filter='', recursive=True, debug=False, profile=None):
     """
     Returns a list of full S3 paths to files in a given S3 bucket and directory path.
     """
@@ -251,7 +258,11 @@ def get_s3_contents(dataset_path, s3_url_prefix=None, filter='', recursive=True,
     # Use posixpath to construct the S3 URL path
     bucket_path = posixpath.join(s3_url_prefix or '', dataset_path)
     # Construct the `aws s3 ls` command
-    cmd = ['aws', 's3', 'ls', bucket_path, '--profile', profile]
+    cmd = ['aws', 's3', 'ls', bucket_path]
+
+    if profile is not None:
+        cmd.extend(['--profile', profile])
+
     if recursive:
         # Add the --recursive flag if requested
         cmd.append('--recursive')
@@ -311,7 +322,7 @@ def get_all_s3_urls(
             if debug:
                 print(f"subset_str = {subset_str}")
             # Get the list of tar files in the current subset directory
-            profile = profiles.get(name, 'default')
+            profile = profiles.get(name, None)
             tar_list = get_s3_contents(
                 subset_str, s3_url_prefix=None, recursive=recursive, filter=filter_str, debug=debug, profile=profile)
             for tar in tar_list:
@@ -341,8 +352,12 @@ def log_and_continue(exn):
 
 
 def is_valid_sample(sample):
-    return "json" in sample and "audio" in sample and not is_silence(sample["audio"])
+    has_json = "json" in sample
+    has_audio = "audio" in sample
+    is_silent = is_silence(sample["audio"])
+    is_rejected = "__reject__" in sample["json"] and sample["json"]["__reject__"]
 
+    return has_json and has_audio and not is_silent and not is_rejected
 
 class S3DatasetConfig:
     def __init__(
@@ -367,6 +382,15 @@ class S3DatasetConfig:
         )
 
         return self.urls
+
+def audio_decoder(key, value):
+    # Get file extension from key
+    ext = key.split(".")[-1]
+
+    if ext in AUDIO_KEYS:
+        return torchaudio.load(io.BytesIO(value))
+    else:
+        return None
 
 def collation_fn(samples):
         batched = list(zip(*samples))
@@ -414,7 +438,7 @@ class S3WebDataLoader():
         self.dataset = wds.DataPipeline(
             wds.ResampledShards(urls),
             wds.tarfile_to_samples(handler=log_and_continue),
-            wds.decode(wds.torch_audio, handler=log_and_continue),
+            wds.decode(audio_decoder, handler=log_and_continue),
             wds.map(self.wds_preprocess, handler=log_and_continue),
             wds.select(is_valid_sample),
             wds.to_tuple("audio", "json", handler=log_and_continue),
@@ -425,11 +449,9 @@ class S3WebDataLoader():
 
     def wds_preprocess(self, sample):
 
-        audio_keys = ("flac", "wav", "mp3", "m4a", "ogg")
-
         found_key, rewrite_key = '', ''
         for k, v in sample.items():  # print the all entries in dict
-            for akey in audio_keys:
+            for akey in AUDIO_KEYS:
                 if k.endswith(akey):
                     # to rename long/weird key with its simpler counterpart
                     found_key, rewrite_key = k, akey
@@ -448,10 +470,11 @@ class S3WebDataLoader():
             # Pad/crop and get the relative timestamp
             pad_crop = PadCrop_Normalized_T(
                 self.sample_size, randomize=self.random_crop, sample_rate=self.sample_rate)
-            audio, t_start, t_end, seconds_start, seconds_total = pad_crop(
+            audio, t_start, t_end, seconds_start, seconds_total, padding_mask = pad_crop(
                 audio)
             sample["json"]["seconds_start"] = seconds_start
             sample["json"]["seconds_total"] = seconds_total
+            sample["json"]["padding_mask"] = padding_mask
         else:
             t_start, t_end = 0, 1
 
@@ -492,13 +515,11 @@ class S3WebDataLoader():
         
         return sample
 
-def create_dataloader_from_configs_and_args(model_config, args, dataset_config):
+def create_dataloader_from_config(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4):
 
     dataset_type = dataset_config.get("dataset_type", None)
 
     assert dataset_type is not None, "Dataset type must be specified in dataset config"
-
-    audio_channels = model_config.get("audio_channels", 2)
 
     if audio_channels == 1:
         force_channels = "mono"
@@ -530,16 +551,16 @@ def create_dataloader_from_configs_and_args(model_config, args, dataset_config):
 
         train_set = SampleDataset(
             training_dirs,
-            sample_rate=model_config["sample_rate"],
-            sample_size=model_config["sample_size"],
+            sample_rate=sample_rate,
+            sample_size=sample_size,
             random_crop=dataset_config.get("random_crop", True),
             force_channels=force_channels,
             custom_metadata_fn=custom_metadata_fn,
             relpath=training_dirs[0] #TODO: Make relpath relative to each training dir
         )
 
-        return torch.utils.data.DataLoader(train_set, args.batch_size, shuffle=True,
-                                num_workers=args.num_workers, persistent_workers=True, pin_memory=True, drop_last=True, collate_fn=collation_fn)
+        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=True,
+                                num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=True, collate_fn=collation_fn)
 
     elif dataset_type == "s3":
         dataset_configs = []
@@ -567,11 +588,11 @@ def create_dataloader_from_configs_and_args(model_config, args, dataset_config):
 
         return S3WebDataLoader(
             dataset_configs,
-            sample_rate=model_config["sample_rate"],
-            sample_size=model_config["sample_size"],
-            batch_size=args.batch_size,
-            random_crop=True,
-            num_workers=args.num_workers,
+            sample_rate=sample_rate,
+            sample_size=sample_size,
+            batch_size=batch_size,
+            random_crop=dataset_config.get("random_crop", True),
+            num_workers=num_workers,
             persistent_workers=True,
             force_channels=force_channels,
             epoch_steps=dataset_config.get("epoch_steps", 2000),
