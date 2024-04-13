@@ -29,45 +29,40 @@ class PadCrop_Normalized_T(nn.Module):
         self.sample_rate = sample_rate
         self.randomize = randomize
 
-    def __call__(self, source: torch.Tensor) -> Tuple[torch.Tensor, float, float, int, int]:
-        
+    def __call__(self, source: torch.Tensor) -> Tuple[torch.Tensor, float, float, int, int, torch.Tensor]:
         n_channels, n_samples = source.shape
-        
-        # If the audio is shorter than the desired length, pad it
-        upper_bound = max(0, n_samples - self.n_samples)
-        
-        # If randomize is False, always start at the beginning of the audio
-        offset = 0
-        if(self.randomize and n_samples > self.n_samples):
-            offset = random.randint(0, upper_bound)
-
+    
+        # Convert total samples to total duration in seconds
+        total_duration_seconds = math.ceil(n_samples / self.sample_rate)
+    
+        # Calculate the maximum offset in samples to ensure the chunk fits
+        max_offset_in_samples = n_samples - self.n_samples
+        max_offset_in_samples = max(0, max_offset_in_samples)
+    
+        # If randomize is True, choose a random starting point, otherwise start at 0
+        if self.randomize and max_offset_in_samples > 0:
+            offset = random.randint(0, max_offset_in_samples)
+        else:
+            offset = 0
+    
+        # Calculate the start time of the chunk in seconds
+        seconds_start = offset / self.sample_rate
+    
         # Calculate the start and end times of the chunk
-        t_start = offset / (upper_bound + self.n_samples)
-        t_end = (offset + self.n_samples) / (upper_bound + self.n_samples)
-
+        t_start = offset / (max_offset_in_samples + self.n_samples)
+        t_end = (offset + self.n_samples) / (max_offset_in_samples + self.n_samples)
+    
         # Create the chunk
         chunk = source.new_zeros([n_channels, self.n_samples])
-
+    
         # Copy the audio into the chunk
         chunk[:, :min(n_samples, self.n_samples)] = source[:, offset:offset + self.n_samples]
         
-        # Calculate the start and end times of the chunk in seconds
-        seconds_start = math.floor(offset / self.sample_rate)
-        seconds_total = math.ceil(n_samples / self.sample_rate)
-
         # Create a mask the same length as the chunk with 1s where the audio is and 0s where it isn't
         padding_mask = torch.zeros([self.n_samples])
         padding_mask[:min(n_samples, self.n_samples)] = 1
-        
-        
-        return (
-            chunk,
-            t_start,
-            t_end,
-            seconds_start,
-            seconds_total,
-            padding_mask
-        )
+    
+        return chunk, t_start, t_end, seconds_start, total_duration_seconds, padding_mask
 
 class PhaseFlipper(nn.Module):
     "Randomly invert the phase of a signal"
