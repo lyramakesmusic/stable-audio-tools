@@ -391,7 +391,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         noise = torch.randn_like(diffusion_input)
         noised_inputs = diffusion_input * alphas + noise * sigmas
         targets = noise * alphas - diffusion_input * sigmas
-
+            
         p.tick("noise")
 
         extra_args = {}
@@ -429,7 +429,14 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                     loss_info["audio_reals_right"] = loss_info["audio_reals"][:, 1:2, :]
 
             loss, losses = self.losses(loss_info)
-
+        
+            if torch.isnan(loss):
+                print(f'NaN loss detected at batch index {batch_idx}')
+                for data in batch[1]:  # Assuming batch[1] contains the metadata list
+                    # print('seconds_total:', data['seconds_total'])
+                    # print('relpath:', data['relpath'])
+                    print(data)
+                
             p.tick("loss")
 
             if self.log_loss_info:
