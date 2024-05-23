@@ -221,18 +221,38 @@ class DACEncoderWrapper(nn.Module):
         x = self.proj_out(x)
         return x
 
+# class DACDecoderWrapper(nn.Module):
+#     def __init__(self, latent_dim, out_channels=1, **kwargs):
+#         super().__init__()
+
+#         from dac.model.dac import Decoder as DACDecoder
+
+#         self.decoder = DACDecoder(**kwargs, input_channel = latent_dim, d_out=out_channels)
+
+#         self.latent_dim = latent_dim
+
+#     def forward(self, x):
+#         return self.decoder(x)
+
 class DACDecoderWrapper(nn.Module):
     def __init__(self, latent_dim, out_channels=1, **kwargs):
         super().__init__()
 
         from dac.model.dac import Decoder as DACDecoder
 
-        self.decoder = DACDecoder(**kwargs, input_channel = latent_dim, d_out=out_channels)
+        # Instantiate the original Decoder
+        self.decoder = DACDecoder(input_channel=latent_dim, d_out=out_channels, **kwargs)
+
+        # Modify the decoder's Sequential model to remove the last Tanh layer
+        modified_layers = list(self.decoder.model.children())[:-1]  # Copy all but the last layer
+        self.decoder.model = nn.Sequential(*modified_layers)  # Replace the model with the modified one
 
         self.latent_dim = latent_dim
 
     def forward(self, x):
         return self.decoder(x)
+
+# fix by @hexorcismos
 
 class AudioAutoencoder(nn.Module):
     def __init__(
