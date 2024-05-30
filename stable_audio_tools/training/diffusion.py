@@ -97,11 +97,18 @@ class DiffusionUncondTrainingWrapper(pl.LightningModule):
         loss_info = {}
 
         loss_info["audio_reals"] = diffusion_input
+        
+        # in cases where latent not found, save it
+        # should only run once per datum
+        if not os.path.exists(f'{loss_info["relpath"]}.pt'):
 
-        if self.diffusion.pretransform is not None:
-            with torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
-                diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
-                loss_info["reals"] = diffusion_input
+            if self.diffusion.pretransform is not None:
+                with torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
+                    diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
+                    loss_info["reals"] = diffusion_input
+
+                    os.makedirs(os.path.dirname(loss_info["relpath"]), exist_ok=True)
+                    torch.save(loss_info, f'{loss_info["relpath"]}.pt')
 
         # Combine the ground truth data and the noise
         alphas = alphas[:, None, None]
