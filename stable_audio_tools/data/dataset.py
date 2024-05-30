@@ -602,71 +602,78 @@ class S3SampleDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.filenames)
 
-    def __getitem__(self, idx):
+        def __getitem__(self, idx):
         while True:
-            s3_key = self.filenames[idx]
-            try:
-                start_time = time.time()
-                audio, in_sr = self.load_file(s3_key)
-    
-                if in_sr != self.sample_rate:
-                    resample_tf = T.Resample(in_sr, self.sample_rate)
-                    audio = resample_tf(audio)
-                    
-                if torch.max(torch.abs(audio)) > 0:
-                    audio = audio / torch.max(torch.abs(audio))
-                else: # Skip the file if it's silent
-                    # print(f'silent file! skipped {s3_key}')
-                    idx = random.randrange(len(self))
-                    continue
-    
-                # Initial timestamps and padding mask in case they are not set below
-                t_start, t_end, seconds_start, seconds_total, padding_mask = 0, 0, 0, 0, None
-    
-                if self.random_crop or self.sample_size:
-                    audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
-                    if seconds_total < 25:
-                        # print(f'\nunder-25s file detected!! {s3_key}: seconds_total={seconds_total}')
-                        idx = random.randrange(len(self))
-                        continue
-    
-                # Check audio for right shape and adjust if necessary
-                if audio.shape[1] < self.sample_size:
-                    print(audio.shape)
-    
-                # Ensure stereo channel
-                if audio.shape[0] < 2:
-                    audio = torch.cat([audio, audio])
-    
-                audio = self.augs(audio) if self.augs is not None else audio
-                audio = self.encoding(audio) if self.encoding is not None else audio
-    
-                relpath = f"{self.subfolder}/{s3_key}" if self.subfolder else s3_key
-    
-                info = {
-                    "path": s3_key,
-                    "relpath": relpath,
-                    "timestamps": (t_start, t_end),
-                    "seconds_start": seconds_start,
-                    "seconds_total": seconds_total,
-                    "padding_mask": padding_mask,
-                    "load_time": time.time() - start_time
-                }
-    
-                if self.custom_metadata_fn:
-                    custom_metadata = self.custom_metadata_fn(info, audio)
-                    info.update(custom_metadata)
-    
-                    if "__reject__" in info and info["__reject__"]:
-                        idx = random.randrange(len(self))
-                        continue
-    
-                return audio, info
-    
-            except Exception as e:
-                print(f'Error loading file {s3_key}: {e}')
-                idx = random.randrange(len(self))  # Get a new index to retry
 
+            s3_key = self.filenames[idx]
+            relpath = f"{self.subfolder}/{s3_key}" if self.subfolder else s3_key
+            cache_path = f"{relpath}.pt"
+            
+            if os.path.exists(cache_path):
+                try:
+                    info = torch.load(cache_path)
+                    audio = info.get("reals", None)
+                    if audio is None:
+                        raise ValueError("Cached data does not contain audio tensor.")
+                    return audio, info
+                except Exception as e:
+                    print(f"Failed to load cached data from {cache_path}: {e}")
+
+            else:
+                try:
+                    start_time = time.time()
+                    audio, in_sr = self.load_file(s3_key)
+        
+                    if in_sr != self.sample_rate:
+                        resample_tf = T.Resample(in_sr, self.sample_rate)
+                        audio = resample_tf(audio)
+                        
+                    if torch.max(torch.abs(audio)) > 0:
+                        audio = audio / torch.max(torch.abs(audio))
+                    else:
+                        idx = random.randrange(len(self)) # new datum
+                        continue
+        
+                    t_start, t_end, seconds_start, seconds_total, padding_mask = 0, 0, 0, 0, None
+        
+                    if self.random_crop or self.sample_size:
+                        audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
+                        if seconds_total < 25:
+                            idx = random.randrange(len(self)) # new datum
+                            continue
+        
+                    if audio.shape[1] < self.sample_size:
+                        print(audio.shape)
+        
+                    if audio.shape[0] < 2:
+                        audio = torch.cat([audio, audio])
+        
+                    audio = self.augs(audio) if self.augs is not None else audio
+                    audio = self.encoding(audio) if self.encoding is not None else audio
+
+                    info = {
+                        "path": s3_key,
+                        "relpath": relpath,
+                        "timestamps": (t_start, t_end),
+                        "seconds_start": seconds_start,
+                        "seconds_total": seconds_total,
+                        "padding_mask": padding_mask,
+                        "load_time": time.time() - start_time
+                    }
+        
+                    if self.custom_metadata_fn:
+                        custom_metadata = self.custom_metadata_fn(info, audio)
+                        info.update(custom_metadata)
+        
+                        if "__reject__" in info and info["__reject__"]:
+                            idx = random.randrange(len(self)) # new datum
+                            continue
+        
+                    return audio, info
+        
+                except Exception as e:
+                    print(f'Error loading file {s3_key}: {e}')
+                    idx = random.randrange(len(self))  # Get a new index to retry
 
 def create_dataloader_from_config(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4):
 
