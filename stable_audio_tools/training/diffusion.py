@@ -97,18 +97,11 @@ class DiffusionUncondTrainingWrapper(pl.LightningModule):
         loss_info = {}
 
         loss_info["audio_reals"] = diffusion_input
-        
-        # in cases where latent not found, save it
-        # should only run once per datum
-        if not os.path.exists(f'{loss_info["relpath"]}.pt'):
 
-            if self.diffusion.pretransform is not None:
-                with torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
-                    diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
-                    loss_info["reals"] = diffusion_input
-
-                    os.makedirs(os.path.dirname(loss_info["relpath"]), exist_ok=True)
-                    torch.save(loss_info, f'{loss_info["relpath"]}.pt')
+        if self.diffusion.pretransform is not None:
+            with torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
+                diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
+                loss_info["reals"] = diffusion_input
 
         # Combine the ground truth data and the noise
         alphas = alphas[:, None, None]
@@ -380,17 +373,37 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         p.tick("conditioning")
 
-        if self.diffusion.pretransform is not None:
-            self.diffusion.pretransform.to(self.device)
+        # if self.diffusion.pretransform is not None:
+        #     self.diffusion.pretransform.to(self.device)
 
-            with torch.cuda.amp.autocast() and torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
-                diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
-                p.tick("pretransform")
+        #     with torch.cuda.amp.autocast() and torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
+        #         diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
+        #         p.tick("pretransform")
 
-                # If mask_padding is on, interpolate the padding masks to the size of the pretransformed input
-                if use_padding_mask:
-                    padding_masks = F.interpolate(padding_masks.unsqueeze(1).float(), size=diffusion_input.shape[2], mode="nearest").squeeze(1).bool()
+        #         # If mask_padding is on, interpolate the padding masks to the size of the pretransformed input
+        #         if use_padding_mask:
+        #             padding_masks = F.interpolate(padding_masks.unsqueeze(1).float(), size=diffusion_input.shape[2], mode="nearest").squeeze(1).bool()
 
+        if isinstance(diffusion_input, torch.Tensor):
+            # If the input is already a tensor, skip the pretransform.
+            p.tick("skipped pretransform")
+            # After processing, unload the pretransform from CUDA
+
+            if self.diffusion.pretransform is not None:
+                self.diffusion.pretransform.cpu()  # Move pretransform back to CPU to free up GPU memory
+                p.tick("unload pretransform")
+        else:
+            if self.diffusion.pretransform is not None:
+                self.diffusion.pretransform.to(self.device)
+                
+                # Using amp.autocast for potential mixed precision and set_grad_enabled based on the pretransform setting
+                with torch.cuda.amp.autocast(), torch.set_grad_enabled(self.diffusion.pretransform.enable_grad):
+                    diffusion_input = self.diffusion.pretransform.encode(diffusion_input)
+                    p.tick("pretransform")
+
+                    # Handle padding masks if required
+                    if use_padding_mask:
+                        padding_masks = F.interpolate(padding_masks.unsqueeze(1).float(), size=diffusion_input.shape[2], mode='nearest').squeeze(1).bool()
 
         # Combine the ground truth data and the noise
         alphas = alphas[:, None, None]
